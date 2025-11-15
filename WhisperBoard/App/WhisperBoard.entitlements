@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Groups for IPC with keyboard extension -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.whisperboard.app</string>
+    </array>
+
+    <!-- Microphone Access -->
+    <key>com.apple.security.device.microphone</key>
+    <true/>
+
+    <!-- Network: Explicitly disabled for privacy -->
+    <!-- WhisperBoard is 100% offline -->
+    <!-- No network entitlement = no network access -->
+</dict>
+</plist>
