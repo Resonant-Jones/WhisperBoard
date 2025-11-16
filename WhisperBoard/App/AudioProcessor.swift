@@ -171,6 +171,14 @@ class AudioProcessor {
         let chunkMessage = try metadataData.decode(as: AudioChunkMessage.self)
         let metadata = chunkMessage.metadata
 
+        // Validate metadata
+        do {
+            try metadata.validate()
+        } catch {
+            Logger.error(error, context: "Invalid metadata for chunk \(metadata.chunkId)", category: "AudioProcessor")
+            throw error
+        }
+
         // Skip if already processed
         guard metadata.chunkId > lastProcessedChunkId else {
             // Already processed, clean up
@@ -201,6 +209,14 @@ class AudioProcessor {
 
         let pcmURL = audioBuffersPath.appendingPathComponent(chunkMessage.pcmFileName)
         let audioData = try Data(contentsOf: pcmURL)
+
+        // Validate audio data size
+        do {
+            try validateAudioDataSize(audioData, metadata: metadata)
+        } catch {
+            Logger.error(error, context: "Invalid audio data for chunk \(metadata.chunkId)", category: "AudioProcessor")
+            throw error
+        }
 
         // Check if this is the next expected chunk
         if metadata.chunkId == lastProcessedChunkId + 1 {
