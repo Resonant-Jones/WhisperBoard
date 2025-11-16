@@ -22,6 +22,8 @@ class KeyboardViewController: UIInputViewController {
 
     private var isRecording = false
     private var currentSessionId: String?
+    private var transcriptionTimeout: Timer?
+    private let timeoutDuration: TimeInterval = 10.0  // 10 second timeout
 
     // MARK: - View Lifecycle
 
@@ -171,7 +173,11 @@ class KeyboardViewController: UIInputViewController {
         } catch {
             handleAudioError(error)
             stopRecording()
+            return
         }
+
+        // Start transcription timeout (10 seconds max)
+        startTranscriptionTimeout()
 
         // Haptic feedback
         let generator = UIImpactFeedbackGenerator(style: .medium)
@@ -182,6 +188,9 @@ class KeyboardViewController: UIInputViewController {
         guard isRecording else { return }
 
         print("[Keyboard] Stopping recording")
+
+        // Cancel timeout
+        cancelTranscriptionTimeout()
 
         // Update UI
         isRecording = false
@@ -229,6 +238,9 @@ class KeyboardViewController: UIInputViewController {
 
     private func handleTranscriptionUpdate(_ result: TranscriptionResult) {
         print("[Keyboard] Received transcription: \"\(result.text)\"")
+
+        // Cancel timeout - we got a result
+        cancelTranscriptionTimeout()
 
         // Update display
         transcriptionLabel.text = result.text
@@ -287,6 +299,48 @@ class KeyboardViewController: UIInputViewController {
         // Check periodically
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.checkMainAppStatus()
+        }
+    }
+
+    // MARK: - Timeout Handling
+
+    private func startTranscriptionTimeout() {
+        // Cancel any existing timeout
+        cancelTranscriptionTimeout()
+
+        // Start new timeout
+        transcriptionTimeout = Timer.scheduledTimer(withTimeInterval: timeoutDuration, repeats: false) { [weak self] _ in
+            self?.handleTranscriptionTimeout()
+        }
+    }
+
+    private func cancelTranscriptionTimeout() {
+        transcriptionTimeout?.invalidate()
+        transcriptionTimeout = nil
+    }
+
+    private func handleTranscriptionTimeout() {
+        print("[Keyboard] ⚠️ Transcription timeout after \(timeoutDuration) seconds")
+
+        // Stop recording if still active
+        if isRecording {
+            stopRecording()
+        }
+
+        // Show timeout message
+        transcriptionLabel.text = "⏱️ Timeout - Please try again"
+        transcriptionLabel.textColor = .systemOrange
+
+        // Haptic feedback
+        let generator = UINotificationFeedbackGenerator()
+        generator.notificationOccurred(.warning)
+
+        // Clear message after delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            if self.transcriptionLabel.text == "⏱️ Timeout - Please try again" {
+                self.transcriptionLabel.text = ""
+                self.transcriptionLabel.textColor = .label
+            }
         }
     }
 

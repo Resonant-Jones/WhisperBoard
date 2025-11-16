@@ -222,6 +222,7 @@ enum MessageError: LocalizedError {
     case encodingFailed
     case decodingFailed
     case invalidData
+    case validationFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -231,6 +232,134 @@ enum MessageError: LocalizedError {
             return "Failed to decode message from JSON"
         case .invalidData:
             return "Invalid message data"
+        case .validationFailed(let reason):
+            return "Validation failed: \(reason)"
         }
     }
 }
+
+// MARK: - Input Validation
+
+/// Validation protocol for IPC messages
+protocol Validatable {
+    func validate() throws
+}
+
+extension AudioChunkMetadata: Validatable {
+    func validate() throws {
+        // Validate chunk ID
+        guard chunkId >= 0 else {
+            throw MessageError.validationFailed("Invalid chunkId: \(chunkId)")
+        }
+
+        // Validate sample rate (must be 16kHz for Whisper)
+        guard sampleRate == 16000 else {
+            throw MessageError.validationFailed("Invalid sample rate: \(sampleRate). Expected 16000 Hz")
+        }
+
+        // Validate channels (must be mono)
+        guard channels == 1 else {
+            throw MessageError.validationFailed("Invalid channels: \(channels). Expected 1 (mono)")
+        }
+
+        // Validate duration (0-10 seconds per chunk)
+        guard duration > 0 && duration <= 10.0 else {
+            throw MessageError.validationFailed("Invalid duration: \(duration). Must be 0-10 seconds")
+        }
+
+        // Validate session ID format (UUID)
+        guard !sessionId.isEmpty && sessionId.count <= 100 else {
+            throw MessageError.validationFailed("Invalid sessionId format")
+        }
+
+        // Validate timestamp (not too far in past/future)
+        let now = Date()
+        let timeDiff = abs(timestamp.timeIntervalSince(now))
+        guard timeDiff < 300 else {  // 5 minutes max time drift
+            throw MessageError.validationFailed("Invalid timestamp: \(timeDiff)s drift")
+        }
+    }
+}
+
+extension TranscriptionResult: Validatable {
+    func validate() throws {
+        // Validate text length (max 10,000 characters)
+        guard text.count <= 10_000 else {
+            throw MessageError.validationFailed("Text too long: \(text.count) characters")
+        }
+
+        // Validate confidence score if present
+        if let confidence = confidence {
+            guard confidence >= 0.0 && confidence <= 1.0 else {
+                throw MessageError.validationFailed("Invalid confidence: \(confidence)")
+            }
+        }
+
+        // Validate processing time (max 60 seconds)
+        guard processingTimeMs >= 0 && processingTimeMs <= 60_000 else {
+            throw MessageError.validationFailed("Invalid processing time: \(processingTimeMs)ms")
+        }
+
+        // Validate session ID
+        guard !sessionId.isEmpty && sessionId.count <= 100 else {
+            throw MessageError.validationFailed("Invalid sessionId")
+        }
+    }
+}
+
+extension WhisperBoardSettings: Validatable {
+    func validate() throws {
+        // Validate VAD threshold (0-1)
+        guard vadThreshold >= 0.0 && vadThreshold <= 1.0 else {
+            throw MessageError.validationFailed("Invalid VAD threshold: \(vadThreshold)")
+        }
+
+        // Validate chunk size (50-1000ms)
+        guard chunkSizeMs >= 50 && chunkSizeMs <= 1000 else {
+            throw MessageError.validationFailed("Invalid chunk size: \(chunkSizeMs)ms")
+        }
+
+        // Validate max recording duration (1-300 seconds)
+        guard maxRecordingDurationSec >= 1 && maxRecordingDurationSec <= 300 else {
+            throw MessageError.validationFailed("Invalid max duration: \(maxRecordingDurationSec)s")
+        }
+
+        // Validate language code if set
+        if let language = language {
+            guard language.count == 2 || language.isEmpty else {
+                throw MessageError.validationFailed("Invalid language code: \(language)")
+            }
+        }
+    }
+}
+
+/// Validate audio data size
+func validateAudioDataSize(_ data: Data, metadata: AudioChunkMetadata) throws {
+    // Calculate expected size
+    let expectedSamples = Int(metadata.duration * Double(metadata.sampleRate))
+    let bytesPerSample: Int
+
+    switch metadata.format {
+    case .pcm16:
+        bytesPerSample = 2  // 16-bit = 2 bytes
+    case .float32:
+        bytesPerSample = 4  // 32-bit = 4 bytes
+    }
+
+    let expectedSize = expectedSamples * bytesPerSample * metadata.channels
+    let actualSize = data.count
+
+    // Allow 10% tolerance for rounding
+    let tolerance = Int(Double(expectedSize) * 0.1)
+    guard abs(actualSize - expectedSize) <= tolerance else {
+        throw MessageError.validationFailed(
+            "Audio data size mismatch. Expected ~\(expectedSize) bytes, got \(actualSize) bytes"
+        )
+    }
+
+    // Maximum 10MB per chunk (safety limit)
+    guard actualSize <= 10_000_000 else {
+        throw MessageError.validationFailed("Audio data too large: \(actualSize) bytes")
+    }
+}
+
