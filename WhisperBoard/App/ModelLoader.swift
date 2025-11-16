@@ -13,7 +13,7 @@ class ModelLoader {
 
     // MARK: - Properties
 
-    private var whisperContext: OpaquePointer?
+    private var whisperContext: UnsafeMutablePointer<whisper_context>?
     private var isModelLoaded = false
     private let modelQueue = DispatchQueue(label: "com.whisperboard.modelloader", qos: .userInitiated)
 
@@ -88,12 +88,24 @@ class ModelLoader {
             print("[ModelLoader] Expected memory: \(modelConfig.variant.expectedMemoryMB) MB")
             print("[ModelLoader] Peak memory: \(modelConfig.variant.expectedPeakMemoryMB) MB")
 
-            // Initialize Whisper context
-            // NOTE: This is a placeholder. Actual whisper.cpp integration requires C++ bridging
-            // whisperContext = whisper_init_from_file_with_params(modelPath, whisper_context_default_params())
+            // Initialize Whisper context with parameters
+            var contextParams = whisper_context_default_params()
+            contextParams.use_gpu = modelConfig.useGPU
+            contextParams.gpu_device = 0  // Use first GPU (Metal)
 
-            guard whisperContext != nil else {
-                throw ModelLoaderError.modelLoadFailed("Failed to initialize Whisper context")
+            // Initialize context
+            whisperContext = modelPath.withCString { pathPtr in
+                whisper_init_from_file_with_params(pathPtr, contextParams)
+            }
+
+            guard let context = whisperContext else {
+                throw ModelLoaderError.modelLoadFailed("Failed to initialize Whisper context. Check model file integrity.")
+            }
+
+            // Print system info
+            if let systemInfo = whisper_print_system_info() {
+                let infoString = String(cString: systemInfo)
+                print("[ModelLoader] System: \(infoString)")
             }
 
             isModelLoaded = true
@@ -106,6 +118,10 @@ class ModelLoader {
 
     /// Warm up the model with a dummy inference to reduce cold-start latency
     private func warmupModel() throws {
+        guard let context = whisperContext else {
+            throw ModelLoaderError.modelLoadFailed("Context not initialized")
+        }
+
         print("[ModelLoader] Warming up model...")
 
         // Create a silent audio buffer (1 second of silence at 16kHz)
@@ -114,9 +130,27 @@ class ModelLoader {
         let numSamples = Int(Double(sampleRate) * duration)
         var silentBuffer = [Float](repeating: 0.0, count: numSamples)
 
-        // Run a dummy inference
-        // NOTE: Placeholder - actual implementation requires whisper.cpp integration
-        // whisper_full(whisperContext, whisper_full_default_params(), &silentBuffer, Int32(numSamples))
+        // Get default parameters for inference
+        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+        params.n_threads = 4
+        params.language = "en".withCString { strdup($0) }  // English
+        params.translate = false
+        params.print_progress = false
+        params.print_special = false
+        params.print_realtime = false
+        params.print_timestamps = false
+
+        // Run warmup inference
+        let result = whisper_full(context, params, &silentBuffer, Int32(numSamples))
+
+        // Free allocated language string
+        if let langPtr = params.language {
+            free(UnsafeMutableRawPointer(mutating: langPtr))
+        }
+
+        if result != 0 {
+            print("[ModelLoader] ⚠️ Warmup inference returned code: \(result)")
+        }
 
         print("[ModelLoader] ✓ Model warmed up")
     }
@@ -151,7 +185,7 @@ class ModelLoader {
             print("[ModelLoader] Unloading model...")
 
             // Free Whisper context
-            // whisper_free(context)
+            whisper_free(context)
 
             whisperContext = nil
             isModelLoaded = false
@@ -192,7 +226,7 @@ class ModelLoader {
     }
 
     /// Get the Whisper context (for inference engine)
-    func getContext() -> OpaquePointer? {
+    func getContext() -> UnsafeMutablePointer<whisper_context>? {
         return modelQueue.sync { whisperContext }
     }
 }
@@ -215,8 +249,3 @@ enum ModelLoaderError: LocalizedError {
         }
     }
 }
-
-// MARK: - Whisper.cpp Placeholder Types
-// These will be replaced with actual whisper.cpp bridging header imports
-
-typealias OpaquePointer = UnsafeMutableRawPointer

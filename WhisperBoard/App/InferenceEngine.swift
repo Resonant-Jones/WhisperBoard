@@ -79,22 +79,22 @@ class InferenceEngine {
                 // Convert audio data to Float array
                 let audioSamples = try self.convertToFloatSamples(audioData, format: metadata.format)
 
-                // Generate mel spectrogram
-                let melSpectrogram = try self.generateMelSpectrogram(audioSamples, sampleRate: metadata.sampleRate)
+                // Run Whisper inference (whisper.cpp handles mel spectrogram internally)
+                let text = try self.runWhisperInference(audioSamples)
 
-                // Run Whisper inference
-                let tokens = try self.runWhisperInference(melSpectrogram)
-
-                // Decode tokens to text
-                let text = try self.decodeTokens(tokens)
+                // Extract tokens for streaming if needed
+                var tokens: [String] = []
+                if self.settings.streamingEnabled, let context = self.modelLoader.getContext() {
+                    tokens = self.extractTokens(from: context)
+                }
 
                 // Calculate processing time
                 let processingTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
 
                 // Send streaming update if enabled
-                if self.settings.streamingEnabled {
+                if self.settings.streamingEnabled && !tokens.isEmpty {
                     let tokenUpdate = TokenUpdate(
-                        tokens: tokens.map { String($0) },
+                        tokens: tokens,
                         text: text,
                         sessionId: sessionId
                     )
@@ -115,7 +115,7 @@ class InferenceEngine {
                     self.currentSessionId = nil
                 }
 
-                print("[InferenceEngine] Processed chunk \(metadata.chunkId) in \(processingTimeMs)ms")
+                print("[InferenceEngine] Processed chunk \(metadata.chunkId) in \(processingTimeMs)ms: \"\(text)\"")
 
             } catch {
                 let errorMsg = ErrorMessage(
@@ -200,81 +200,83 @@ class InferenceEngine {
         return floatSamples
     }
 
-    // MARK: - Mel Spectrogram
-
-    /// Generate mel spectrogram from audio samples
-    /// NOTE: This is a simplified placeholder. Production version should use whisper.cpp's mel generation
-    private func generateMelSpectrogram(_ samples: [Float], sampleRate: Int) throws -> [[Float]] {
-        // Whisper expects 80 mel bins and 16kHz sample rate
-        let nMels = 80
-        let nFFT = 400  // 25ms window at 16kHz
-        let hopLength = 160  // 10ms hop
-
-        // Calculate number of frames
-        let nFrames = (samples.count - nFFT) / hopLength + 1
-
-        // Placeholder: In production, this would call whisper.cpp's log_mel_spectrogram
-        var melSpectrogram = [[Float]](repeating: [Float](repeating: 0, count: nMels), count: nFrames)
-
-        // NOTE: Actual implementation requires whisper.cpp integration:
-        // whisper_log_mel_spectrogram(samples, sampleRate, nFFT, hopLength, nMels, &melSpectrogram)
-
-        return melSpectrogram
-    }
-
     // MARK: - Whisper Inference
 
-    /// Run Whisper inference on mel spectrogram
-    /// NOTE: Placeholder - requires whisper.cpp integration
-    private func runWhisperInference(_ melSpectrogram: [[Float]]) throws -> [Int] {
+    /// Run Whisper inference directly on audio samples
+    /// whisper.cpp handles mel spectrogram generation internally
+    private func runWhisperInference(_ samples: [Float]) throws -> String {
         guard let context = modelLoader.getContext() else {
             throw InferenceError.modelNotLoaded
         }
 
-        // Placeholder for whisper.cpp inference
-        // In production:
-        // var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
-        // params.language = settings.language ?? "en"
-        // params.n_threads = 4
-        // params.speed_up = true
-        //
-        // whisper_full(context, params, melSpectrogram.flatMap { $0 }, melSpectrogram.count)
-        //
-        // var tokens = [Int]()
-        // let n_segments = whisper_full_n_segments(context)
-        // for i in 0..<n_segments {
-        //     let n_tokens = whisper_full_n_tokens(context, i)
-        //     for j in 0..<n_tokens {
-        //         let token = whisper_full_get_token_id(context, i, j)
-        //         tokens.append(Int(token))
-        //     }
-        // }
+        // Setup inference parameters
+        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+        params.n_threads = 4
+        params.translate = false
+        params.single_segment = false
+        params.print_progress = false
+        params.print_special = false
+        params.print_realtime = false
+        params.print_timestamps = false
+        params.token_timestamps = settings.streamingEnabled
+        params.speed_up = true  // Enable speed optimization
+        params.suppress_blank = true
+        params.suppress_non_speech_tokens = true
 
-        // Placeholder return
-        return []
+        // Set language (nil = auto-detect)
+        if let language = settings.language {
+            params.language = language.withCString { strdup($0) }
+            params.detect_language = false
+        } else {
+            params.language = "en".withCString { strdup($0) }  // Default to English
+            params.detect_language = false
+        }
+
+        // Run inference
+        var samplesCopy = samples  // Make mutable copy
+        let result = whisper_full(context, params, &samplesCopy, Int32(samples.count))
+
+        // Free allocated language string
+        if let langPtr = params.language {
+            free(UnsafeMutableRawPointer(mutating: langPtr))
+        }
+
+        if result != 0 {
+            throw InferenceError.inferenceFailed
+        }
+
+        // Extract transcription text from all segments
+        var fullText = ""
+        let nSegments = whisper_full_n_segments(context)
+
+        for i in 0..<nSegments {
+            if let segmentText = whisper_full_get_segment_text(context, Int32(i)) {
+                let text = String(cString: segmentText)
+                fullText += text
+            }
+        }
+
+        // Apply punctuation mode if needed
+        fullText = applyPunctuationMode(fullText, mode: settings.punctuationMode)
+
+        return fullText.trimmingCharacters(in: .whitespaces)
     }
 
-    /// Decode tokens to text
-    /// NOTE: Placeholder - requires whisper.cpp integration
-    private func decodeTokens(_ tokens: [Int]) throws -> String {
-        guard let context = modelLoader.getContext() else {
-            throw InferenceError.modelNotLoaded
+    /// Extract tokens from whisper context (for streaming)
+    private func extractTokens(from context: UnsafeMutablePointer<whisper_context>) -> [String] {
+        var tokens: [String] = []
+
+        let nSegments = whisper_full_n_segments(context)
+        for i in 0..<nSegments {
+            let nTokens = whisper_full_n_tokens(context, Int32(i))
+            for j in 0..<nTokens {
+                if let tokenText = whisper_full_get_token_text(context, Int32(i), Int32(j)) {
+                    tokens.append(String(cString: tokenText))
+                }
+            }
         }
 
-        // Placeholder for whisper.cpp token decoding
-        // In production:
-        // var text = ""
-        // for token in tokens {
-        //     if let tokenText = whisper_token_to_str(context, Int32(token)) {
-        //         text += String(cString: tokenText)
-        //     }
-        // }
-        //
-        // Apply punctuation mode
-        // text = applyPunctuationMode(text, mode: settings.punctuationMode)
-
-        // Placeholder return
-        return ""
+        return tokens
     }
 
     /// Apply punctuation mode to text
