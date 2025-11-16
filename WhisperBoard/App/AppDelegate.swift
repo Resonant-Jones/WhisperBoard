@@ -63,6 +63,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // Start periodic cleanup
         tokenStream.startPeriodicCleanup()
 
+        // Clean up orphaned files from previous sessions
+        cleanupOrphanedFiles()
+
         // Create main window
         window = UIWindow(frame: UIScreen.main.bounds)
         window?.rootViewController = MainViewController(
@@ -88,12 +91,35 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidReceiveMemoryWarning(_ application: UIApplication) {
-        print("⚠️ Memory Warning!")
+        print("⚠️ Memory Warning! Taking emergency action...")
 
-        // Could implement emergency memory relief here:
-        // - Unload model temporarily
-        // - Clear caches
-        // - Cancel ongoing transcription
+        // Cancel any ongoing transcription
+        audioProcessor.stopMonitoring()
+
+        // Show memory warning to user
+        showMemoryWarning()
+
+        // Give system a moment to release memory
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            // Restart monitoring after memory pressure subsides
+            self?.audioProcessor.startMonitoring()
+        }
+    }
+
+    /// Show memory warning alert
+    private func showMemoryWarning() {
+        guard let rootVC = window?.rootViewController else { return }
+
+        let alert = UIAlertController(
+            title: "Low Memory",
+            message: "Please close some apps to free up memory.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+
+        DispatchQueue.main.async {
+            rootVC.present(alert, animated: true)
+        }
     }
 
     // MARK: - Model Loading
@@ -172,6 +198,50 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         alert.addAction(UIAlertAction(title: "OK", style: .default))
 
         window?.rootViewController?.present(alert, animated: true)
+    }
+
+    // MARK: - Cleanup
+
+    /// Clean up orphaned files from previous sessions
+    private func cleanupOrphanedFiles() {
+        DispatchQueue.global(qos: .utility).async {
+            print("[App] Cleaning up orphaned files...")
+
+            let directories = [
+                AppGroups.Paths.audioBuffers,
+                AppGroups.Paths.transcriptions,
+                AppGroups.Paths.control
+            ]
+
+            // Delete files older than 1 hour
+            let cutoff = Date().addingTimeInterval(-3600)
+
+            for directory in directories.compactMap({ $0 }) {
+                do {
+                    let files = try FileManager.default.contentsOfDirectory(
+                        at: directory,
+                        includingPropertiesForKeys: [.contentModificationDateKey],
+                        options: [.skipsHiddenFiles]
+                    )
+
+                    var deletedCount = 0
+                    for file in files {
+                        if let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
+                           let modDate = attributes[.modificationDate] as? Date,
+                           modDate < cutoff {
+                            try? FileManager.default.removeItem(at: file)
+                            deletedCount += 1
+                        }
+                    }
+
+                    if deletedCount > 0 {
+                        print("[App] Cleaned up \(deletedCount) orphaned files from \(directory.lastPathComponent)")
+                    }
+                } catch {
+                    print("[App] Failed to cleanup \(directory.lastPathComponent): \(error)")
+                }
+            }
+        }
     }
 }
 

@@ -20,6 +20,10 @@ class AudioProcessor {
     private var currentSessionId: String?
     private let processingQueue = DispatchQueue(label: "com.whisperboard.audioprocessor", qos: .userInitiated)
 
+    /// Chunk sequencing buffer for out-of-order chunks
+    private var chunkBuffer: [Int: (data: Data, metadata: AudioChunkMetadata, url: URL, pcmURL: URL)] = [:]
+    private let maxBufferSize = 10  // Maximum chunks to buffer before dropping
+
     /// Polling interval for checking new audio chunks (in seconds)
     private let pollingInterval: TimeInterval = 0.05  // 50ms for low latency
 
@@ -94,17 +98,19 @@ class AudioProcessor {
         case .start:
             currentSessionId = message.sessionId
             lastProcessedChunkId = -1
+            chunkBuffer.removeAll()  // Clear buffer for new session
             inferenceEngine.startSession(sessionId: message.sessionId)
 
         case .stop:
             // Final chunk will trigger completion in processAudioChunk
-
             break
 
         case .cancel:
             inferenceEngine.cancelSession()
+            cleanupSession(currentSessionId)
             currentSessionId = nil
             lastProcessedChunkId = -1
+            chunkBuffer.removeAll()
 
         case .ping:
             // Respond with status
@@ -113,8 +119,10 @@ class AudioProcessor {
         case .resetModel:
             // Reset model state
             inferenceEngine.cancelSession()
+            cleanupSession(currentSessionId)
             currentSessionId = nil
             lastProcessedChunkId = -1
+            chunkBuffer.removeAll()
         }
     }
 
@@ -165,6 +173,12 @@ class AudioProcessor {
 
         // Skip if already processed
         guard metadata.chunkId > lastProcessedChunkId else {
+            // Already processed, clean up
+            try? FileManager.default.removeItem(at: metadataURL)
+            if let audioBuffersPath = AppGroups.Paths.audioBuffers {
+                let pcmURL = audioBuffersPath.appendingPathComponent(chunkMessage.pcmFileName)
+                try? FileManager.default.removeItem(at: pcmURL)
+            }
             return
         }
 
@@ -173,6 +187,10 @@ class AudioProcessor {
               currentSession == metadata.sessionId else {
             // Delete old session files
             try? FileManager.default.removeItem(at: metadataURL)
+            if let audioBuffersPath = AppGroups.Paths.audioBuffers {
+                let pcmURL = audioBuffersPath.appendingPathComponent(chunkMessage.pcmFileName)
+                try? FileManager.default.removeItem(at: pcmURL)
+            }
             return
         }
 
@@ -184,17 +202,63 @@ class AudioProcessor {
         let pcmURL = audioBuffersPath.appendingPathComponent(chunkMessage.pcmFileName)
         let audioData = try Data(contentsOf: pcmURL)
 
+        // Check if this is the next expected chunk
+        if metadata.chunkId == lastProcessedChunkId + 1 {
+            // Process immediately - this is the next in sequence
+            processChunk(audioData, metadata: metadata)
+            lastProcessedChunkId = metadata.chunkId
+
+            // Clean up files
+            try? FileManager.default.removeItem(at: metadataURL)
+            try? FileManager.default.removeItem(at: pcmURL)
+
+            // Process any buffered chunks that are now in sequence
+            processBufferedChunks()
+
+        } else {
+            // Out of order - buffer it
+            print("[AudioProcessor] ⚠️ Chunk \(metadata.chunkId) arrived out of order (expected \(lastProcessedChunkId + 1)), buffering")
+
+            // Check buffer size limit
+            if chunkBuffer.count >= maxBufferSize {
+                print("[AudioProcessor] ⚠️ Chunk buffer overflow (\(chunkBuffer.count) chunks), dropping oldest")
+                // Find and remove oldest chunk
+                if let oldestId = chunkBuffer.keys.min() {
+                    if let oldChunk = chunkBuffer.removeValue(forKey: oldestId) {
+                        try? FileManager.default.removeItem(at: oldChunk.url)
+                        try? FileManager.default.removeItem(at: oldChunk.pcmURL)
+                    }
+                }
+            }
+
+            // Buffer this chunk
+            chunkBuffer[metadata.chunkId] = (audioData, metadata, metadataURL, pcmURL)
+        }
+    }
+
+    /// Process a chunk and send to inference engine
+    private func processChunk(_ audioData: Data, metadata: AudioChunkMetadata) {
         print("[AudioProcessor] Processing chunk \(metadata.chunkId), \(audioData.count) bytes")
-
-        // Send to inference engine
         inferenceEngine.processAudioChunk(audioData, metadata: metadata)
+    }
 
-        // Update last processed chunk ID
-        lastProcessedChunkId = metadata.chunkId
+    /// Process any buffered chunks that are now in sequence
+    private func processBufferedChunks() {
+        var nextChunkId = lastProcessedChunkId + 1
 
-        // Clean up processed files
-        try? FileManager.default.removeItem(at: metadataURL)
-        try? FileManager.default.removeItem(at: pcmURL)
+        // Keep processing chunks as long as we have the next one in sequence
+        while let bufferedChunk = chunkBuffer.removeValue(forKey: nextChunkId) {
+            print("[AudioProcessor] Processing buffered chunk \(nextChunkId)")
+
+            processChunk(bufferedChunk.data, metadata: bufferedChunk.metadata)
+            lastProcessedChunkId = nextChunkId
+
+            // Clean up files
+            try? FileManager.default.removeItem(at: bufferedChunk.url)
+            try? FileManager.default.removeItem(at: bufferedChunk.pcmURL)
+
+            nextChunkId += 1
+        }
     }
 
     // MARK: - Status Updates
@@ -224,6 +288,54 @@ class AudioProcessor {
     func startStatusUpdates() {
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.updateAppStatus()
+        }
+    }
+
+    // MARK: - Session Cleanup
+
+    /// Clean up all files for a session
+    private func cleanupSession(_ sessionId: String?) {
+        guard let sessionId = sessionId else { return }
+
+        processingQueue.async {
+            print("[AudioProcessor] Cleaning up session: \(sessionId)")
+
+            // Clear chunk buffer
+            self.chunkBuffer.removeAll()
+
+            // Clean up audio buffers directory
+            if let audioBuffersPath = AppGroups.Paths.audioBuffers {
+                do {
+                    let files = try FileManager.default.contentsOfDirectory(
+                        at: audioBuffersPath,
+                        includingPropertiesForKeys: nil,
+                        options: [.skipsHiddenFiles]
+                    )
+
+                    for file in files where file.lastPathComponent.contains(sessionId) {
+                        try? FileManager.default.removeItem(at: file)
+                    }
+                } catch {
+                    print("[AudioProcessor] Failed to cleanup session files: \(error)")
+                }
+            }
+
+            // Clean up transcriptions directory
+            if let transcriptionsPath = AppGroups.Paths.transcriptions {
+                do {
+                    let files = try FileManager.default.contentsOfDirectory(
+                        at: transcriptionsPath,
+                        includingPropertiesForKeys: nil,
+                        options: [.skipsHiddenFiles]
+                    )
+
+                    for file in files where file.lastPathComponent.contains(sessionId) {
+                        try? FileManager.default.removeItem(at: file)
+                    }
+                } catch {
+                    print("[AudioProcessor] Failed to cleanup transcription files: \(error)")
+                }
+            }
         }
     }
 }
